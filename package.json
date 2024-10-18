@@ -1,0 +1,50 @@
+{
+  "name": "dvm-video-thumbnails",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "./build/index.js",
+  "typings": "./build/index.d.ts",
+  "bin": "./build/index.js",
+  "license": "MIT",
+  "files": [
+    "build",
+    "views",
+    "public"
+  ],
+  "scripts": {
+    "build": "rm -rf build && tsc",
+    "dev": "node development.mjs",
+    "start": "node build/index.js",
+    "format": "prettier -w . --ignore-path .gitignore",
+    "prepare": "tsc",
+    "support": "npx @getalby/pkgzap-cli"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.4.0",
+    "axios": "^1.6.8",
+    "crypto": "^1.0.1",
+    "dayjs": "^1.11.10",
+    "debug": "^4.3.4",
+    "dotenv": "^16.4.5",
+    "fs": "^0.0.1-security",
+    "get-file-object-from-local-path": "^1.0.2",
+    "lowdb": "^7.0.1",
+    "nanoid": "^5.0.7",
+    "nostr-tools": "^2.5.0",
+    "promisify": "^0.0.3",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/debug": "^4.1.12",
+    "@types/node": "^20.12.7",
+    "@types/ws": "^8.5.10",
+    "nodemon": "^3.1.0",
+    "prettier": "^3.2.5",
+    "shelljs": "^0.8.5",
+    "typescript": "^5.4.5"
+  },
+  "funding": {
+    "type": "lightning",
+    "url": "lightning:hzrd149@getalby.com"
+  }
+}
