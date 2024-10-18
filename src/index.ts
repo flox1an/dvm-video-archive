@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import dayjs, { unix } from 'dayjs';
-import { NostrEvent, Subscription, Filter, finalizeEvent, nip04, EventTemplate, getPublicKey } from 'nostr-tools';
+import { NostrEvent, Filter, finalizeEvent, nip04, EventTemplate, getPublicKey } from 'nostr-tools';
 import { BLOSSOM_BLOB_EXPIRATION_DAYS, BLOSSOM_UPLOAD_SERVER, NOSTR_PRIVATE_KEY, NOSTR_RELAYS } from './env.js';
 import { getInput, getInputParam, getInputParams, getInputTag, getOutputType, getRelays } from './helpers/dvm.js';
 import { unique } from './helpers/array.js';
@@ -15,6 +15,7 @@ import { deleteBlob, listBlobs, uploadFile } from './helpers/blossom.js';
 import { rmSync } from 'fs';
 import { downloadYoutubeVideo } from './helpers/ytdlp.js';
 import path from 'path';
+import { Subscription } from 'nostr-tools/abstract-relay';
 
 type JobContext = {
   request: NostrEvent;
