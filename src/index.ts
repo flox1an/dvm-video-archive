@@ -1,8 +1,18 @@
 #!/usr/bin/env node
-import dayjs, { unix } from 'dayjs';
-import { NostrEvent, Filter, finalizeEvent, nip04, EventTemplate, getPublicKey } from 'nostr-tools';
-import { BLOSSOM_BLOB_EXPIRATION_DAYS, BLOSSOM_UPLOAD_SERVER, NOSTR_PRIVATE_KEY, NOSTR_RELAYS } from './env.js';
-import { getInput, getInputParam, getInputParams, getInputTag, getOutputType, getRelays } from './helpers/dvm.js';
+import dayjs from 'dayjs';
+import {
+  NostrEvent,
+  Filter,
+  finalizeEvent,
+  nip04,
+  EventTemplate,
+  getPublicKey,
+  nip19,
+  kinds,
+  nip44,
+} from 'nostr-tools';
+import { BLOSSOM_UPLOAD_SERVER, NOSTR_PRIVATE_KEY, NOSTR_RELAYS } from './env.js';
+import { getInput, getInputParam, getInputTag, getOutputType, getRelays } from './helpers/dvm.js';
 import { unique } from './helpers/array.js';
 import { pool } from './pool.js';
 import { logger } from './debug.js';
@@ -11,20 +21,36 @@ import {
   DVM_VIDEO_ARCHIVE_REQUEST_KIND,
   DVM_VIDEO_ARCHIVE_RESULT_KIND as DVM_VIDEO_ARCHIVE_RESULT_KIND,
 } from './const.js';
-import { deleteBlob, listBlobs, uploadFile } from './helpers/blossom.js';
+import { listBlobs, uploadFile } from './helpers/blossom.js';
 import { rmSync } from 'fs';
 import { downloadYoutubeVideo } from './helpers/ytdlp.js';
 import path from 'path';
 import { Subscription } from 'nostr-tools/abstract-relay';
+import { JobContext } from './types.js';
+import { mintUrl, publishPaymentRequiredEvent } from './cashu.js';
+import { CashuMint, CashuWallet, getEncodedTokenV4, PaymentRequestPayload, Token } from '@cashu/cashu-ts';
 
-type JobContext = {
-  request: NostrEvent;
-  wasEncrypted: boolean;
-  url: string;
-  // imageFormat: 'jpg' | 'png';
-  // uploadServer: string;
-  // authTokens: string[];
-};
+const paymentPending: { context: JobContext; requestDate: number }[] = [];
+
+console.log(getEncodedTokenV4({
+  token: [
+    {
+      proofs: [
+        {
+          amount: 1,
+          C: '02e3a21d9046ebb8ad3cadb7bdee14052a9021c2d303d5577118402a3c7bcf3cd5',
+          id: '9mlfd5vCzgGl',
+          //id: '013747238f83',
+          secret: 'f1900cadb13cb242402bf473dfeec82ca0f1088e1500ab2e1c50d722f591172b',
+        },
+      ],
+      mint: mintUrl,
+    },
+  ],
+}));
+process.exit(0);
+
+// wallet.checkProofsSpent()
 
 async function shouldAcceptJob(request: NostrEvent): Promise<JobContext> {
   const input = getInput(request);
@@ -32,19 +58,6 @@ async function shouldAcceptJob(request: NostrEvent): Promise<JobContext> {
 
   // const authTokens = getInputParams(request, "authToken");
   const thumbnailCount = parseInt(getInputParam(request, 'thumbnailCount', '3'), 10);
-
-  /*
-  switch (output) {
-    case 'image/jpeg':
-      imageFormat = 'jpg';
-      break;
-    case 'image/png':
-      imageFormat = 'png';
-      break;
-    default:
-      throw new Error(`Unsupported output type ${output}`);
-  }
-  */
 
   if (thumbnailCount < 1 || thumbnailCount > 10) {
     throw new Error(`Thumbnail count has to be between 1 and 10`);
@@ -55,17 +68,26 @@ async function shouldAcceptJob(request: NostrEvent): Promise<JobContext> {
   } else throw new Error(`Unknown input type ${input.type}`);
 }
 
-async function publishStatusEvent(context: JobContext, status: string, data = '') {
+export async function publishStatusEvent(
+  context: JobContext,
+  status: string,
+  data = '',
+  additionalTags: string[][] = []
+) {
+  const tags = [
+    ['status', status],
+    ['e', context.request.id],
+    ['p', context.request.pubkey],
+  ];
+  tags.push(...additionalTags);
+
   const statusEvent = {
     kind: DVM_STATUS_KIND, // DVM Status
-    tags: [
-      ['status', status],
-      ['e', context.request.id],
-      ['p', context.request.pubkey],
-    ],
+    tags,
     content: data,
     created_at: dayjs().unix(),
   };
+  console.log('statusEvent', statusEvent);
 
   // const event = await ensureEncrypted(resultEvent, context.request.pubkey, context.wasEncrypted);
   const result = finalizeEvent(statusEvent, NOSTR_PRIVATE_KEY);
@@ -73,6 +95,12 @@ async function publishStatusEvent(context: JobContext, status: string, data = ''
   await Promise.all(
     pool.publish(unique([...getRelays(context.request), ...NOSTR_RELAYS]), result).map(p => p.catch(e => {}))
   );
+}
+
+async function doPayRequest(context: JobContext) {
+  logger(`Requesting payment for ${context.request.id}`);
+  await publishPaymentRequiredEvent(context);
+  paymentPending.push({ context, requestDate: Date.now() });
 }
 
 async function doWork(context: JobContext) {
@@ -200,20 +228,82 @@ async function ensureDecrypted(event: NostrEvent) {
   return { wasEncrypted: false, event };
 }
 
-const seen = new Set<string>();
+const seenEvents = new Set<string>();
+
 async function handleEvent(event: NostrEvent) {
-  if (event.kind === DVM_VIDEO_ARCHIVE_REQUEST_KIND && !seen.has(event.id)) {
+  if (!seenEvents.has(event.id)) {
     try {
-      seen.add(event.id);
-      const { wasEncrypted, event: decryptedEvent } = await ensureDecrypted(event);
-      const context = await shouldAcceptJob(decryptedEvent);
-      context.wasEncrypted = wasEncrypted;
-      try {
-        await doWork(context);
-      } catch (e) {
-        if (e instanceof Error) {
-          logger(`Failed to process request ${decryptedEvent.id} because`, e.message);
-          console.log(e);
+      seenEvents.add(event.id);
+      if (event.kind === DVM_VIDEO_ARCHIVE_REQUEST_KIND) {
+        const { wasEncrypted, event: decryptedEvent } = await ensureDecrypted(event);
+        const context = await shouldAcceptJob(decryptedEvent);
+        context.wasEncrypted = wasEncrypted;
+        try {
+          await doPayRequest(context);
+        } catch (e) {
+          if (e instanceof Error) {
+            logger(`Failed to process request ${decryptedEvent.id} because`, e.message);
+            console.log(e);
+          }
+        }
+      }
+      if (event.kind === kinds.GiftWrap) {
+        const wrapEvent = event;
+        const wappedContent = nip44.v2.decrypt(
+          wrapEvent.content,
+          nip44.v2.utils.getConversationKey(NOSTR_PRIVATE_KEY, wrapEvent.pubkey)
+        );
+        const sealEvent = JSON.parse(wappedContent) as NostrEvent;
+        const dmEventString = nip44.v2.decrypt(
+          sealEvent.content,
+          nip44.v2.utils.getConversationKey(NOSTR_PRIVATE_KEY, sealEvent.pubkey)
+        );
+        const dmEvent = JSON.parse(dmEventString) as NostrEvent;
+        const content = dmEvent.content;
+        let jobId: string | undefined;
+
+        console.log('dm content', content);
+        try {
+          const payload = JSON.parse(content) as PaymentRequestPayload;
+          if (payload) {
+            //const receiveStore = useReceiveTokensStore();
+            const { id, memo, proofs, mint, unit } = payload;
+            jobId = id;
+            const tokenForDisplay = {
+              token: [{ proofs: proofs, mint: mint }],
+              unit: unit,
+            } as Token;
+            console.log('encodedToken', getEncodedTokenV4(tokenForDisplay), id, memo);
+            //receiveStore.showReceiveTokens = true;
+
+            const mintService = new CashuMint(mint);
+            const wallet = new CashuWallet(mintService);
+            const proofsAfterSwap = await wallet.receiveTokenEntry(payload);
+            console.log(JSON.stringify(proofsAfterSwap));
+            const tokenAfterSwap = {
+              token: [{ proofs: proofsAfterSwap, mint }],
+              unit,
+            } as Token;
+            console.log('encodedToken-after-receive', getEncodedTokenV4(tokenAfterSwap));
+          }
+        } catch (e) {
+          console.log('### parsing message for ecash failed', e);
+          return;
+        }
+
+        //const payment
+        //nip17DirectMessageEvents.add(dmEvent)
+        //this.lastEventTimestamp = Math.floor(Date.now() / 1000);
+
+        //this.parseMessageForEcash(content);        // get context from pendingpayments
+        // unwrap DM
+        // parse cashu token
+        // swap with the mint
+        const job = paymentPending.find(p => p.context.request.id == jobId);
+        if (job) {
+          await publishStatusEvent(job.context, 'processing', 'Payment received'); // TODO get teh correct job context
+
+          await doWork(job.context); // TODO get teh correct job context
         }
       }
     } catch (e) {
@@ -225,8 +315,12 @@ async function handleEvent(event: NostrEvent) {
 }
 
 const subscriptions: { [key: string]: Subscription } = {};
+const pubkey = getPublicKey(NOSTR_PRIVATE_KEY);
 
-const filters: Filter[] = [{ kinds: [DVM_VIDEO_ARCHIVE_REQUEST_KIND], since: dayjs().unix() }];
+const filters: Filter[] = [
+  { kinds: [DVM_VIDEO_ARCHIVE_REQUEST_KIND], since: dayjs().unix() },
+  { kinds: [kinds.GiftWrap], '#p': [pubkey], since: dayjs().unix() },
+];
 
 async function ensureSubscriptions() {
   logger(
@@ -287,7 +381,7 @@ await cleanupBlobs();
 setInterval(cleanupBlobs, 60 * 60 * 1000); // Clean up blobs every hour
 
 await ensureSubscriptions();
-setInterval(ensureSubscriptions, 30_000); // Ensure connections every 30s
+setInterval(ensureSubscriptions, 60_000); // Ensure connections every 30s
 
 async function shutdown() {
   process.exit();
@@ -296,21 +390,4 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.once('SIGUSR2', shutdown);
 
-/*
-const context = {
-  request: {} as NostrEvent,
-  wasEncrypted: false,
-  url: 'https://www.youtube.com/watch?v=SBjQ9tuuTJQ',
-} as JobContext;
-await doWork(context);
-*/
-/*
-
-POst progress event when job is taken (here we could add payment)
- post progress with metadata when meta is there
- post thumbnail when thumb was uploaded
- post success when video was uploaded
-
-
-
-*/
+//console.log(nip19.nsecEncode(NOSTR_PRIVATE_KEY));

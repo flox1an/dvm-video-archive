@@ -1,4 +1,4 @@
-import type { Event } from "nostr-tools";
+import { Event } from "nostr-tools";
 
 export function getInputTag(e: Event) {
   const tag = e.tags.find((t) => t[0] === "i");
@@ -29,3 +29,4 @@ export function getInputParam(e: Event, k: string, defaultValue?: string) {
   if (value === undefined) throw new Error(`Missing ${k} param`);
   return value;
 }
+
