@@ -10,7 +10,8 @@ import { createHash } from 'crypto';
 
 const logger = debug('dvm:blossom');
 
-type BlobDescriptor = {
+
+export type BlobDescriptor = {
   created: number;
   type?: string;
   sha256: string;

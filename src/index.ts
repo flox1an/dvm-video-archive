@@ -7,7 +7,6 @@ import {
   nip04,
   EventTemplate,
   getPublicKey,
-  nip19,
   kinds,
   nip44,
 } from 'nostr-tools';
@@ -23,34 +22,22 @@ import {
 } from './const.js';
 import { listBlobs, uploadFile } from './helpers/blossom.js';
 import { rmSync } from 'fs';
-import { downloadYoutubeVideo } from './helpers/ytdlp.js';
+import { downloadYoutubeVideo, VideoContent } from './helpers/ytdlp.js';
 import path from 'path';
 import { Subscription } from 'nostr-tools/abstract-relay';
 import { JobContext } from './types.js';
-import { mintUrl, publishPaymentRequiredEvent } from './cashu.js';
-import { CashuMint, CashuWallet, getEncodedTokenV4, PaymentRequestPayload, Token } from '@cashu/cashu-ts';
+import { encodeToken, publishPaymentRequiredEvent } from './cashu.js';
+import {
+  CashuMint,
+  CashuWallet,
+  PaymentRequestPayload,
+  Token,
+} from '@cashu/cashu-ts';
+import { createTemplateVideoEvent } from './helpers/nostr.js';
 
-const paymentPending: { context: JobContext; requestDate: number }[] = [];
+type PendingJob = { context: JobContext; requestDate: number };
 
-console.log(getEncodedTokenV4({
-  token: [
-    {
-      proofs: [
-        {
-          amount: 1,
-          C: '02e3a21d9046ebb8ad3cadb7bdee14052a9021c2d303d5577118402a3c7bcf3cd5',
-          id: '9mlfd5vCzgGl',
-          //id: '013747238f83',
-          secret: 'f1900cadb13cb242402bf473dfeec82ca0f1088e1500ab2e1c50d722f591172b',
-        },
-      ],
-      mint: mintUrl,
-    },
-  ],
-}));
-process.exit(0);
-
-// wallet.checkProofsSpent()
+const paymentPending: PendingJob[] = [];
 
 async function shouldAcceptJob(request: NostrEvent): Promise<JobContext> {
   const input = getInput(request);
@@ -107,7 +94,8 @@ async function doWork(context: JobContext) {
   logger(`Starting work for ${context.request.id}`);
   const startTime = dayjs().unix();
 
-  await publishStatusEvent(context, 'processing', 'Starting video download');
+  // this is alow transmitted on payment received.
+  //  await publishStatusEvent(context, 'processing', JSON.stringify({ msg: 'Starting video download' }));
 
   logger(`downloading video for URL ${context.url}`);
   const videoContent = await downloadYoutubeVideo(context.url);
@@ -116,17 +104,20 @@ async function doWork(context: JobContext) {
     throw new Error(`Error downloading video ` + context.url);
   }
 
-  await publishStatusEvent(context, 'partial', 'Download completed. Uploading to ' + BLOSSOM_UPLOAD_SERVER);
+  await publishStatusEvent(
+    context,
+    'partial',
+    JSON.stringify({ msg: 'Download completed. Uploading to ' + BLOSSOM_UPLOAD_SERVER })
+  );
 
   const resultTags: string[][] = [];
-  const videoBlob = await uploadFile(
+  const videoBlobPromise = uploadFile(
     videoContent.videoPath,
     BLOSSOM_UPLOAD_SERVER,
     'video/mp4',
     path.basename(videoContent.videoPath),
     'Upload Video'
   );
-  logger(`Uploaded video file: ${videoBlob.url}`);
 
   const thumbBlob = await uploadFile(
     videoContent.thumbnailPath,
@@ -136,38 +127,16 @@ async function doWork(context: JobContext) {
     'Upload Thumbnail'
   );
   logger(`Uploaded thumbnail file: ${thumbBlob.url}`);
+  publishStatusEvent(
+    context,
+    'partial',
+    JSON.stringify({ thumb: thumbBlob.url.endsWith('.webp') ? thumbBlob.url : thumbBlob.url + '.webp' })
+  );
 
-  const videoEventTemplate = {
-    created_at: dayjs().unix(), // TODO should this be today / now?
-    kind: 34235,
-    tags: [
-      ['d', `${videoContent.infoData.extractor}-${videoContent.infoData.id}`],
-      [
-        'url',
-        videoBlob.url.endsWith('.mp4') ? videoBlob.url : videoBlob.url + '.mp4', // TODO fix for other formats
-      ],
-      ['title', videoContent.infoData.title],
-      ['summary', videoContent.infoData.description],
-      ['published_at', `${videoContent.infoData.timestamp}`],
-      ['client', 'dvm-nostr-video-archive'],
-      ['m', 'video/mp4'], // TODO fix for other formats
-      ['size', `${videoBlob.size}`],
-      ['duration', `${videoContent.infoData.duration}`],
-      [
-        'thumb',
-        thumbBlob.url.endsWith('.webp') ? thumbBlob.url : thumbBlob.url + '.webp', // TODO fix for other formats
-      ],
-      [
-        'image',
-        thumbBlob.url.endsWith('.webp') ? thumbBlob.url : thumbBlob.url + '.webp', // TODO fix for other formats
-      ],
-      ['r', videoContent.infoData.webpage_url],
-      ...videoContent.infoData.tags.map(tag => ['t', tag]),
-    ],
-    content: videoContent.infoData.title,
-  };
+  const videoBlob = await videoBlobPromise;
+  logger(`Uploaded video file: ${videoBlob.url}`);
 
-  //console.log(videoEventTemplate);
+  const videoEventTemplate = createTemplateVideoEvent(videoContent, videoBlob, thumbBlob);
 
   const resultEvent = {
     kind: DVM_VIDEO_ARCHIVE_RESULT_KIND,
@@ -230,6 +199,63 @@ async function ensureDecrypted(event: NostrEvent) {
 
 const seenEvents = new Set<string>();
 
+async function processPaymentAndRunJob(paymentMessageContent: string) {
+  let pendingJob: PendingJob | undefined;
+  try {
+    const payload = JSON.parse(paymentMessageContent) as PaymentRequestPayload;
+
+    if (payload) {
+      const { id, memo, proofs, mint, unit } = payload;
+
+      const receivedTokenForDisplay = encodeToken({
+        token: [{ proofs: proofs, mint: mint }],
+        unit: unit,
+      } as Token);
+      console.log('encodedToken', receivedTokenForDisplay, id, memo);
+      // TODO store rceived tokens
+
+      pendingJob = paymentPending.find(p => p.context.request.id == payload.id);
+      if (!pendingJob) {
+        console.error('Could not find a pending job for the payment');
+        return;
+      }
+      console.log('Received a payment for job ', pendingJob);
+
+      // validate amount
+      const total = proofs.reduce((prev, p) => (prev += p.amount), 0);
+      if (unit != 'sat' || total < 1) {
+        throw new Error('Received ' + total + ' ' + unit + ': unsufficient funds');
+      }
+
+      const mintService = new CashuMint(mint);
+      const wallet = new CashuWallet(mintService);
+      const proofsAfterSwap = await wallet.receiveTokenEntry(payload);
+
+      console.log(JSON.stringify(proofsAfterSwap));
+      const tokenAfterSwap = {
+        token: [{ proofs: proofsAfterSwap, mint }],
+        unit,
+      } as Token;
+
+      const encodedToken = encodeToken(tokenAfterSwap);
+      console.log('encodedToken-after-swap', encodedToken);
+      // TODO store swapped tokens
+    }
+  } catch (e) {
+    console.log('### parsing message for ecash failed', e);
+    return;
+  }
+
+  if (pendingJob) {
+    await publishStatusEvent(
+      pendingJob.context,
+      'processing',
+      JSON.stringify({ msg: 'Payment received. Downloading video...' })
+    );
+    await doWork(pendingJob.context);
+  }
+}
+
 async function handleEvent(event: NostrEvent) {
   if (!seenEvents.has(event.id)) {
     try {
@@ -248,63 +274,8 @@ async function handleEvent(event: NostrEvent) {
         }
       }
       if (event.kind === kinds.GiftWrap) {
-        const wrapEvent = event;
-        const wappedContent = nip44.v2.decrypt(
-          wrapEvent.content,
-          nip44.v2.utils.getConversationKey(NOSTR_PRIVATE_KEY, wrapEvent.pubkey)
-        );
-        const sealEvent = JSON.parse(wappedContent) as NostrEvent;
-        const dmEventString = nip44.v2.decrypt(
-          sealEvent.content,
-          nip44.v2.utils.getConversationKey(NOSTR_PRIVATE_KEY, sealEvent.pubkey)
-        );
-        const dmEvent = JSON.parse(dmEventString) as NostrEvent;
-        const content = dmEvent.content;
-        let jobId: string | undefined;
-
-        console.log('dm content', content);
-        try {
-          const payload = JSON.parse(content) as PaymentRequestPayload;
-          if (payload) {
-            //const receiveStore = useReceiveTokensStore();
-            const { id, memo, proofs, mint, unit } = payload;
-            jobId = id;
-            const tokenForDisplay = {
-              token: [{ proofs: proofs, mint: mint }],
-              unit: unit,
-            } as Token;
-            console.log('encodedToken', getEncodedTokenV4(tokenForDisplay), id, memo);
-            //receiveStore.showReceiveTokens = true;
-
-            const mintService = new CashuMint(mint);
-            const wallet = new CashuWallet(mintService);
-            const proofsAfterSwap = await wallet.receiveTokenEntry(payload);
-            console.log(JSON.stringify(proofsAfterSwap));
-            const tokenAfterSwap = {
-              token: [{ proofs: proofsAfterSwap, mint }],
-              unit,
-            } as Token;
-            console.log('encodedToken-after-receive', getEncodedTokenV4(tokenAfterSwap));
-          }
-        } catch (e) {
-          console.log('### parsing message for ecash failed', e);
-          return;
-        }
-
-        //const payment
-        //nip17DirectMessageEvents.add(dmEvent)
-        //this.lastEventTimestamp = Math.floor(Date.now() / 1000);
-
-        //this.parseMessageForEcash(content);        // get context from pendingpayments
-        // unwrap DM
-        // parse cashu token
-        // swap with the mint
-        const job = paymentPending.find(p => p.context.request.id == jobId);
-        if (job) {
-          await publishStatusEvent(job.context, 'processing', 'Payment received'); // TODO get teh correct job context
-
-          await doWork(job.context); // TODO get teh correct job context
-        }
+        const content = unwrapGiftWrapDM(event);
+        await processPaymentAndRunJob(content);
       }
     } catch (e) {
       if (e instanceof Error) {
@@ -319,8 +290,26 @@ const pubkey = getPublicKey(NOSTR_PRIVATE_KEY);
 
 const filters: Filter[] = [
   { kinds: [DVM_VIDEO_ARCHIVE_REQUEST_KIND], since: dayjs().unix() },
-  { kinds: [kinds.GiftWrap], '#p': [pubkey], since: dayjs().unix() },
+  { kinds: [kinds.GiftWrap], '#p': [pubkey], since: dayjs().unix() - 24 * 60 * 60 },
 ];
+
+function unwrapGiftWrapDM(event: NostrEvent): string {
+  const wrapEvent = event;
+  const wappedContent = nip44.v2.decrypt(
+    wrapEvent.content,
+    nip44.v2.utils.getConversationKey(NOSTR_PRIVATE_KEY, wrapEvent.pubkey)
+  );
+  const sealEvent = JSON.parse(wappedContent) as NostrEvent;
+  const dmEventString = nip44.v2.decrypt(
+    sealEvent.content,
+    nip44.v2.utils.getConversationKey(NOSTR_PRIVATE_KEY, sealEvent.pubkey)
+  );
+  const dmEvent = JSON.parse(dmEventString) as NostrEvent;
+  const content = dmEvent.content;
+
+  console.log('dm content', content);
+  return content;
+}
 
 async function ensureSubscriptions() {
   logger(
@@ -390,4 +379,4 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.once('SIGUSR2', shutdown);
 
-//console.log(nip19.nsecEncode(NOSTR_PRIVATE_KEY));
+// console.log(nip19.nsecEncode(NOSTR_PRIVATE_KEY));

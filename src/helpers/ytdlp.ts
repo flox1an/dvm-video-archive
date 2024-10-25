@@ -73,7 +73,7 @@ interface YoutubeVideoInfo {
   };
 }
 
-type VideoContent = {
+export type VideoContent = {
   tempDir: string;
   videoPath: string;
   infoData: YoutubeVideoInfo;
