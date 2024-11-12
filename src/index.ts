@@ -1,16 +1,7 @@
 #!/usr/bin/env node
 import dayjs from 'dayjs';
-import {
-  NostrEvent,
-  Filter,
-  finalizeEvent,
-  nip04,
-  EventTemplate,
-  getPublicKey,
-  kinds,
-  nip44,
-} from 'nostr-tools';
-import { BLOSSOM_UPLOAD_SERVER, NOSTR_PRIVATE_KEY, NOSTR_RELAYS } from './env.js';
+import { NostrEvent, Filter, finalizeEvent, nip04, EventTemplate, getPublicKey, kinds, nip44 } from 'nostr-tools';
+import { BLOSSOM_BLOB_EXPIRATION_DAYS, BLOSSOM_UPLOAD_SERVER, NOSTR_PRIVATE_KEY, NOSTR_RELAYS } from './env.js';
 import { getInput, getInputParam, getInputTag, getOutputType, getRelays } from './helpers/dvm.js';
 import { unique } from './helpers/array.js';
 import { pool } from './pool.js';
@@ -20,24 +11,23 @@ import {
   DVM_VIDEO_ARCHIVE_REQUEST_KIND,
   DVM_VIDEO_ARCHIVE_RESULT_KIND as DVM_VIDEO_ARCHIVE_RESULT_KIND,
 } from './const.js';
-import { listBlobs, uploadFile } from './helpers/blossom.js';
+import { deleteBlob, listBlobs, uploadFile } from './helpers/blossom.js';
 import { rmSync } from 'fs';
 import { downloadYoutubeVideo, VideoContent } from './helpers/ytdlp.js';
 import path from 'path';
 import { Subscription } from 'nostr-tools/abstract-relay';
 import { JobContext } from './types.js';
 import { encodeToken, publishPaymentRequiredEvent } from './cashu.js';
-import {
-  CashuMint,
-  CashuWallet,
-  PaymentRequestPayload,
-  Token,
-} from '@cashu/cashu-ts';
+import { CashuMint, CashuWallet, PaymentRequestPayload, Token } from '@cashu/cashu-ts';
 import { createTemplateVideoEvent } from './helpers/nostr.js';
+import { appendPaymentToken } from './helpers/tokenstore.js';
 
 type PendingJob = { context: JobContext; requestDate: number };
 
 const paymentPending: PendingJob[] = [];
+
+const receivedTokenStore = 'received_cashu_tokens.txt';
+const swappedTokens = 'swapped_cashu_tokens.txt';
 
 async function shouldAcceptJob(request: NostrEvent): Promise<JobContext> {
   const input = getInput(request);
@@ -199,7 +189,7 @@ async function ensureDecrypted(event: NostrEvent) {
 
 const seenEvents = new Set<string>();
 
-async function processPaymentAndRunJob(paymentMessageContent: string) {
+async function processPaymentAndRunJob(sender: string, paymentMessageContent: string) {
   let pendingJob: PendingJob | undefined;
   try {
     const payload = JSON.parse(paymentMessageContent) as PaymentRequestPayload;
@@ -207,12 +197,12 @@ async function processPaymentAndRunJob(paymentMessageContent: string) {
     if (payload) {
       const { id, memo, proofs, mint, unit } = payload;
 
-      const receivedTokenForDisplay = encodeToken({
+      const receivedToken = encodeToken({
         token: [{ proofs: proofs, mint: mint }],
         unit: unit,
       } as Token);
-      console.log('encodedToken', receivedTokenForDisplay, id, memo);
-      // TODO store rceived tokens
+      console.log('encodedToken', receivedToken, id, memo);
+      appendPaymentToken(sender, receivedTokenStore, receivedToken);
 
       pendingJob = paymentPending.find(p => p.context.request.id == payload.id);
       if (!pendingJob) {
@@ -239,7 +229,7 @@ async function processPaymentAndRunJob(paymentMessageContent: string) {
 
       const encodedToken = encodeToken(tokenAfterSwap);
       console.log('encodedToken-after-swap', encodedToken);
-      // TODO store swapped tokens
+      appendPaymentToken(sender, swappedTokens, encodedToken);
     }
   } catch (e) {
     console.log('### parsing message for ecash failed', e);
@@ -274,8 +264,8 @@ async function handleEvent(event: NostrEvent) {
         }
       }
       if (event.kind === kinds.GiftWrap) {
-        const content = unwrapGiftWrapDM(event);
-        await processPaymentAndRunJob(content);
+        const dmEvent = unwrapGiftWrapDM(event);
+        await processPaymentAndRunJob(dmEvent.pubkey, dmEvent.content);
       }
     } catch (e) {
       if (e instanceof Error) {
@@ -293,7 +283,7 @@ const filters: Filter[] = [
   { kinds: [kinds.GiftWrap], '#p': [pubkey], since: dayjs().unix() - 24 * 60 * 60 },
 ];
 
-function unwrapGiftWrapDM(event: NostrEvent): string {
+function unwrapGiftWrapDM(event: NostrEvent): NostrEvent {
   const wrapEvent = event;
   const wappedContent = nip44.v2.decrypt(
     wrapEvent.content,
@@ -305,10 +295,9 @@ function unwrapGiftWrapDM(event: NostrEvent): string {
     nip44.v2.utils.getConversationKey(NOSTR_PRIVATE_KEY, sealEvent.pubkey)
   );
   const dmEvent = JSON.parse(dmEventString) as NostrEvent;
-  const content = dmEvent.content;
 
-  console.log('dm content', content);
-  return content;
+  console.log('dm content', dmEvent.content);
+  return dmEvent;
 }
 
 async function ensureSubscriptions() {
@@ -353,7 +342,6 @@ async function cleanupBlobs() {
   const pubkey = getPublicKey(NOSTR_PRIVATE_KEY);
   const blobs = await listBlobs(BLOSSOM_UPLOAD_SERVER, pubkey); // TODO add from/until to filter by timestamp
 
-  /*
   const cutOffDate = dayjs().unix() - 60 * 60 * 24 * BLOSSOM_BLOB_EXPIRATION_DAYS;
   for (const blob of blobs) {
     if (blob.created < cutOffDate) {
@@ -361,7 +349,7 @@ async function cleanupBlobs() {
       await deleteBlob(BLOSSOM_UPLOAD_SERVER, blob.sha256);
     }
   }
-    */
+    
   const storedSize = blobs.reduce((prev, val) => prev + val.size, 0);
   logger(`Currently stored ${storedSize / 1024 / 1024 / 1024} GB.`);
 }

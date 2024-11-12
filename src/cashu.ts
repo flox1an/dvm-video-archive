@@ -1,13 +1,13 @@
 import { getEncodedToken, getEncodedTokenV4, PaymentRequest, PaymentRequestTransportType, Token } from "@cashu/cashu-ts";
 import { getPublicKey, nip19 } from "nostr-tools";
-import { CASHU_MINT_URL, NOSTR_PRIVATE_KEY, NOSTR_RELAYS } from "./env.js";
+import { NOSTR_PRIVATE_KEY, NOSTR_RELAYS, PAYMENT_AMOUNT, PAYMENT_MINT_URL } from "./env.js";
 import { JobContext } from "./types.js";
 import { publishStatusEvent } from "./index.js";
 
 
 export async function publishPaymentRequiredEvent(context: JobContext
 ) {
-  const amount = 1;
+  const amount = PAYMENT_AMOUNT;
   const pr: PaymentRequest = new PaymentRequest(
     [
       {
@@ -22,7 +22,7 @@ export async function publishPaymentRequiredEvent(context: JobContext
     context.request.id, // reference to DVM request ID
     amount,
     'sat',
-    [CASHU_MINT_URL],
+    [PAYMENT_MINT_URL],
     'Payment for Youtube Download DVM',
     true
   );
